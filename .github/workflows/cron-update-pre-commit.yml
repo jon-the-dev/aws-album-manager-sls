@@ -18,7 +18,7 @@ jobs:
         git config --global --add safe.directory '*'
         pre-commit autoupdate
     - name: Create Pull Request
-      uses: peter-evans/create-pull-request@c5a7806660adbe173f04e3e038b0ccdcd758773c
+      uses: peter-evans/create-pull-request@271a8d0340265f705b14b6d32b9829c1cb33d45e
       with:
         token: ${{ secrets.ACTIONS_CREATE_PR_PAT }}
         commit-message: Update pre-commit hook versions
