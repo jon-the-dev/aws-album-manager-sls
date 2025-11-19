@@ -7,16 +7,79 @@ plugins:
 provider:
   name: aws
   runtime: python3.11
-  stage: dev
-  region: us-east-1
+  stage: ${opt:stage, 'dev'}
+  region: ${opt:region, 'us-east-1'}
+
+  # Environment variables for Lambda functions
+  environment:
+    ENV: ${self:provider.stage}
+    S3_BUCKET_NAME: ${self:custom.s3BucketName}
+    SES_SENDER_EMAIL: ${self:custom.sesSenderEmail}
+
+  # SECURITY: Least privilege IAM permissions - replacing wildcard Resource: "*"
   iamRoleStatements:
+    # DynamoDB permissions - scoped to specific tables
     - Effect: Allow
       Action:
         - dynamodb:PutItem
         - dynamodb:GetItem
+        - dynamodb:UpdateItem
+        - dynamodb:Query
+        - dynamodb:Scan
+      Resource:
+        - !GetAtt ClientsTable.Arn
+        - !GetAtt PayPalWebhooksTable.Arn
+        - "arn:aws:dynamodb:${self:provider.region}:*:table/AlbumDetails"
+
+    # S3 permissions - scoped to specific bucket
+    - Effect: Allow
+      Action:
         - s3:GetObject
+        - s3:PutObject
+        - s3:PutObjectAcl
+        - s3:DeleteObject
+      Resource:
+        - "arn:aws:s3:::${self:custom.s3BucketName}/*"
+
+    # S3 bucket-level permissions
+    - Effect: Allow
+      Action:
+        - s3:ListBucket
+      Resource:
+        - "arn:aws:s3:::${self:custom.s3BucketName}"
+
+    # SES permissions - scoped to specific sender identity
+    - Effect: Allow
+      Action:
         - ses:SendEmail
-      Resource: "*"
+        - ses:SendRawEmail
+      Resource:
+        - "arn:aws:ses:${self:provider.region}:*:identity/${self:custom.sesSenderEmail}"
+      Condition:
+        StringEquals:
+          ses:FromAddress: ${self:custom.sesSenderEmail}
+
+    # SSM Parameter Store permissions - scoped to album-manager namespace
+    - Effect: Allow
+      Action:
+        - ssm:GetParameter
+        - ssm:GetParameters
+      Resource:
+        - "arn:aws:ssm:${self:provider.region}:*:parameter/album-manager/${self:provider.stage}/*"
+
+  # Enable Lambda function logs encryption
+  logs:
+    restApi: true
+
+  # Enable tracing for debugging (X-Ray)
+  tracing:
+    lambda: true
+    apiGateway: true
+
+# Custom variables
+custom:
+  s3BucketName: album-manager-${self:provider.stage}-${aws:accountId}
+  sesSenderEmail: noreply@example.com  # REPLACE with your verified SES email
 
 functions:
   webhookReceiver:
@@ -46,6 +109,7 @@ functions:
 
 resources:
   Resources:
+    # DynamoDB Tables
     ClientsTable:
       Type: AWS::DynamoDB::Table
       Properties:
@@ -57,6 +121,17 @@ resources:
           - AttributeName: clientID
             KeyType: HASH
         BillingMode: PAY_PER_REQUEST
+        # PERFORMANCE: Enable point-in-time recovery for data protection
+        PointInTimeRecoverySpecification:
+          PointInTimeRecoveryEnabled: true
+        # SECURITY: Enable server-side encryption
+        SSESpecification:
+          SSEEnabled: true
+        Tags:
+          - Key: Environment
+            Value: ${self:provider.stage}
+          - Key: Application
+            Value: album-manager
 
     PayPalWebhooksTable:
       Type: AWS::DynamoDB::Table
@@ -69,6 +144,121 @@ resources:
           - AttributeName: order_id
             KeyType: HASH
         BillingMode: PAY_PER_REQUEST
+        PointInTimeRecoverySpecification:
+          PointInTimeRecoveryEnabled: true
+        SSESpecification:
+          SSEEnabled: true
+        # PERFORMANCE: Set TTL to auto-delete old webhook events
+        TimeToLiveSpecification:
+          AttributeName: expiresAt
+          Enabled: true
+        Tags:
+          - Key: Environment
+            Value: ${self:provider.stage}
+          - Key: Application
+            Value: album-manager
+
+    AlbumDetailsTable:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        TableName: AlbumDetails
+        AttributeDefinitions:
+          - AttributeName: albumID
+            AttributeType: S
+          - AttributeName: clientName
+            AttributeType: S
+        KeySchema:
+          - AttributeName: albumID
+            KeyType: HASH
+        # PERFORMANCE: Add GSI for querying by clientName
+        GlobalSecondaryIndexes:
+          - IndexName: ClientNameIndex
+            KeySchema:
+              - AttributeName: clientName
+                KeyType: HASH
+            Projection:
+              ProjectionType: ALL
+        BillingMode: PAY_PER_REQUEST
+        PointInTimeRecoverySpecification:
+          PointInTimeRecoveryEnabled: true
+        SSESpecification:
+          SSEEnabled: true
+        # PERFORMANCE: Set TTL to auto-delete expired download links
+        TimeToLiveSpecification:
+          AttributeName: expiresAt
+          Enabled: true
+        Tags:
+          - Key: Environment
+            Value: ${self:provider.stage}
+          - Key: Application
+            Value: album-manager
+
+    # S3 Bucket for album storage
+    AlbumStorageBucket:
+      Type: AWS::S3::Bucket
+      Properties:
+        BucketName: ${self:custom.s3BucketName}
+        # SECURITY: Block public access
+        PublicAccessBlockConfiguration:
+          BlockPublicAcls: true
+          BlockPublicPolicy: true
+          IgnorePublicAcls: true
+          RestrictPublicBuckets: true
+        # SECURITY: Enable versioning for data protection
+        VersioningConfiguration:
+          Status: Enabled
+        # SECURITY: Enable server-side encryption
+        BucketEncryption:
+          ServerSideEncryptionConfiguration:
+            - ServerSideEncryptionByDefault:
+                SSEAlgorithm: AES256
+        # PERFORMANCE: Lifecycle rules to transition old files to cheaper storage
+        LifecycleConfiguration:
+          Rules:
+            - Id: TransitionToIA
+              Status: Enabled
+              Transitions:
+                - TransitionInDays: 30
+                  StorageClass: STANDARD_IA
+                - TransitionInDays: 90
+                  StorageClass: GLACIER
+            - Id: DeleteOldVersions
+              Status: Enabled
+              NoncurrentVersionExpirationInDays: 90
+        # SECURITY: Enable access logging
+        LoggingConfiguration:
+          DestinationBucketName: !Ref AlbumStorageLogsBucket
+          LogFilePrefix: access-logs/
+        Tags:
+          - Key: Environment
+            Value: ${self:provider.stage}
+          - Key: Application
+            Value: album-manager
+
+    # S3 Bucket for access logs
+    AlbumStorageLogsBucket:
+      Type: AWS::S3::Bucket
+      Properties:
+        BucketName: ${self:custom.s3BucketName}-logs
+        PublicAccessBlockConfiguration:
+          BlockPublicAcls: true
+          BlockPublicPolicy: true
+          IgnorePublicAcls: true
+          RestrictPublicBuckets: true
+        BucketEncryption:
+          ServerSideEncryptionConfiguration:
+            - ServerSideEncryptionByDefault:
+                SSEAlgorithm: AES256
+        LifecycleConfiguration:
+          Rules:
+            - Id: DeleteOldLogs
+              Status: Enabled
+              ExpirationInDays: 90
+        Tags:
+          - Key: Environment
+            Value: ${self:provider.stage}
+          - Key: Application
+            Value: album-manager
 
     # Lambda Function Errors Alarm
     LambdaErrorsAlarm:
